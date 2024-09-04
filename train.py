@@ -47,7 +47,8 @@ log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
 always_save_checkpoint = True # if True, always save a checkpoint after each eval
-init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+#init_from = 'scratch' # 'scratch' or 'resume' or 'gpt2*'
+init_from = 'resume' # 'scratch' or 'resume' or 'gpt2*'
 # wandb logging
 wandb_log = False # disabled by default
 wandb_project = 'owt'
@@ -256,9 +257,8 @@ def get_lr(it):
 
 # logging
 if wandb_log and master_process:
-    pass
-    #import wandb
-    #wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    import wandb
+    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -330,10 +330,7 @@ while True:
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
-        print(f'Logging with wandb is set to {wandb_log}')
         if wandb_log:
-            pass
-            '''
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
@@ -341,7 +338,6 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
-            '''
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -356,7 +352,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-                if 100>total_perplexity>80:
+                if 165>total_perplexity>60:
                     torch.save(checkpoint, os.path.join(out_dir, f'ckpt_total_perplexity{total_perplexity}.pt'))  
     dist.barrier()
     if iter_num == 0 and eval_only:
