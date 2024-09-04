@@ -184,7 +184,21 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            logits = logits.float()
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = targets[..., 1:].contiguous()
+            # Flatten the tokens
+            shift_logits = shift_logits.view(-1, self.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            #TODO: what should ignore_index be?
+            # karpathy uses -100 https://github.com/karpathy/nano-llama31/blob/master/llama31.py#L310
+            # he also points out that the tokenizer is messed up https://github.com/karpathy/nano-llama31/commit/2310647b11a1bc7cd773b5b7dd6bbacac5477973
+            #i am tempted to set ignore_index=128000 because it can show up at the end of sequences multiple times
+            loss = F.cross_entropy(shift_logits, shift_labels)
+            #loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim

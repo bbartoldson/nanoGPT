@@ -29,11 +29,20 @@ from torch.distributed import init_process_group, destroy_process_group
 
 from model import GPTConfig, GPT
 
+import data
+from transformers import PreTrainedTokenizerFast, LlamaForCausalLM
+import torch.nn.functional as F
+import torch.distributed as dist
+
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
-eval_interval = 2000
+out_dir = '/pscratch/sd/b/bartolds/speculative-diffusion/nanoGPT/llama_31_vocab/'
+snapshot_sampling = True # if True, generate samples
+sample_dir = out_dir+'samples/'
+eval_generative_perplexity = True # if True, compute Llama 3.1's perplexity on samples
+eval_generative_perplexity_batch_size = 8
+eval_interval = 1000
 log_interval = 1
 eval_iters = 200
 eval_only = False # if True, script exits right after the first eval
@@ -45,8 +54,8 @@ wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
 dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+gradient_accumulation_steps = 5 * 4 # used to simulate larger batch sizes
+batch_size = 24 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -113,21 +122,33 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 
 # poor man's data loader
 data_dir = os.path.join('data', dataset)
+
+# Build data iterators
+cfg = type('', (), {x:type('', (), {})() for x in ['training','eval','model','data']})()
+cfg.ngpus = ddp_world_size
+cfg.training.batch_size = gradient_accumulation_steps * ddp_world_size * batch_size
+cfg.training.accum = gradient_accumulation_steps
+cfg.eval.batch_size = gradient_accumulation_steps * ddp_world_size * batch_size
+cfg.model.length = 1024
+cfg.data.train = 'openwebtext'
+cfg.data.valid = 'wikitext103'
+cfg.data.cache_dir = '/pscratch/sd/b/bartolds/hugging_face_datasets'
+LLAMA_LOC = '/global/cfs/projectdirs/m4536/Llama/Meta-Llama-3.1-8B'
+tokenizer = PreTrainedTokenizerFast.from_pretrained(LLAMA_LOC)
+#print(tokenizer.pad_id): 'PreTrainedTokenizerFast' object has no attribute 'pad_id'
+train_ds, eval_ds = data.get_dataloaders(cfg, tokenizer)
+train_iter = iter(train_ds)
+eval_iter = iter(eval_ds)
+    
 def get_batch(split):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
     if split == 'train':
-        data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
+        batch = next(train_iter)['input_ids'].to(device)
     else:
-        data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
-    ix = torch.randint(len(data) - block_size, (batch_size,))
-    x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
-    y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
-    if device_type == 'cuda':
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(device, non_blocking=True)
-    else:
-        x, y = x.to(device), y.to(device)
+        batch = next(eval_iter)['input_ids'].to(device)
+        
+    x = batch
+    y = batch
+    
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
@@ -135,13 +156,7 @@ iter_num = 0
 best_val_loss = 1e9
 
 # attempt to derive vocab_size from the dataset
-meta_path = os.path.join(data_dir, 'meta.pkl')
-meta_vocab_size = None
-if os.path.exists(meta_path):
-    with open(meta_path, 'rb') as f:
-        meta = pickle.load(f)
-    meta_vocab_size = meta['vocab_size']
-    print(f"found vocab_size = {meta_vocab_size} (inside {meta_path})")
+meta_vocab_size = 128256 # llama 3.1 vocab size
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
@@ -149,10 +164,7 @@ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=bloc
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
-    # determine the vocab size we'll use for from-scratch training
-    if meta_vocab_size is None:
-        print("defaulting to vocab_size of GPT-2 to 50304 (50257 rounded up for efficiency)")
-    model_args['vocab_size'] = meta_vocab_size if meta_vocab_size is not None else 50304
+    model_args['vocab_size'] = meta_vocab_size
     gptconf = GPTConfig(**model_args)
     model = GPT(gptconf)
 elif init_from == 'resume':
@@ -220,6 +232,7 @@ def estimate_loss():
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             X, Y = get_batch(split)
+            #print(f'Data shapes {X.shape,Y.shape}')
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
@@ -243,8 +256,9 @@ def get_lr(it):
 
 # logging
 if wandb_log and master_process:
-    import wandb
-    wandb.init(project=wandb_project, name=wandb_run_name, config=config)
+    pass
+    #import wandb
+    #wandb.init(project=wandb_project, name=wandb_run_name, config=config)
 
 # training loop
 X, Y = get_batch('train') # fetch the very first batch
@@ -252,6 +266,16 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+@torch.no_grad()
+def sample_model():
+    model.eval()
+    start_ids = [tokenizer.bos_token_id]*(256//ddp_world_size)
+    x = (torch.tensor(start_ids, dtype=torch.long, device=device)[...,None])
+    sample = raw_model.generate(x, 1024)
+    model.train()
+    return sample
+
 while True:
 
     # determine and set the learning rate for this iteration
@@ -259,11 +283,57 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+    # Generate and save samples
+    total_perplexity = None
+    if snapshot_sampling and iter_num % eval_interval == 0:
+        if master_process:
+            print(f"Generating text at step: {iter_num}")
+
+        this_sample_dir = os.path.join(sample_dir, "iter_{}".format(iter_num))
+        os.makedirs(this_sample_dir, exist_ok=True)
+        
+        sample = sample_model()
+
+        sentences = tokenizer.batch_decode(sample)
+        if master_process:
+            print(sentences[0][:150],'\n...\n',sentences[0][-150:])
+
+        file_name = os.path.join(this_sample_dir, f"sample_{ddp_local_rank}.txt")
+        with open(file_name, 'w') as file:
+            for sentence in sentences:
+                file.write(sentence + "\n")
+                file.write("============================================================================================\n")
+
+        if eval_generative_perplexity:
+            with torch.no_grad():
+                eval_model = LlamaForCausalLM.from_pretrained(LLAMA_LOC).to(device).eval()
+
+                batches = max(sample.shape[0] // eval_generative_perplexity_batch_size, 1)
+                total_perplexity = 0
+                for i in range(batches):
+                    s = sample[i * eval_generative_perplexity_batch_size:(i + 1) * eval_generative_perplexity_batch_size]
+                    loss, logits = eval_model(s, labels=s)[:2]
+                    logits = logits.transpose(-1, -2)
+                    perplexity = F.cross_entropy(logits[..., :-1], s[..., 1:], reduction="none").mean(dim=-1).exp().mean()
+                    total_perplexity += perplexity
+                total_perplexity /= batches
+                dist.all_reduce(total_perplexity)
+                total_perplexity /= ddp_world_size
+                if master_process:
+                    print(f"Generative Perplexity at step: {iter_num}. Perplexity: {total_perplexity:.3f}.")
+
+                del eval_model, logits, loss
+
+        dist.barrier()
+
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f'Logging with wandb is set to {wandb_log}')
         if wandb_log:
+            pass
+            '''
             wandb.log({
                 "iter": iter_num,
                 "train/loss": losses['train'],
@@ -271,6 +341,7 @@ while True:
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             })
+            '''
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -281,12 +352,16 @@ while True:
                     'iter_num': iter_num,
                     'best_val_loss': best_val_loss,
                     'config': config,
+                    'total_perplexity': total_perplexity,
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                if 100>total_perplexity>80:
+                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt_total_perplexity{total_perplexity}.pt'))  
+    dist.barrier()
     if iter_num == 0 and eval_only:
         break
-
+        
     # forward backward update, with optional gradient accumulation to simulate larger batch size
     # and using the GradScaler if data type is float16
     for micro_step in range(gradient_accumulation_steps):
