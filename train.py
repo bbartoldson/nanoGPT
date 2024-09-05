@@ -148,7 +148,7 @@ def get_batch(split):
         batch = next(eval_iter)['input_ids'].to(device)
         
     x = batch
-    y = batch
+    y = batch.clone()
     
     return x, y
 
@@ -352,8 +352,7 @@ while True:
                 }
                 print(f"saving checkpoint to {out_dir}")
                 torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
-                if 165>total_perplexity>60:
-                    torch.save(checkpoint, os.path.join(out_dir, f'ckpt_total_perplexity{total_perplexity}.pt'))  
+                torch.save(checkpoint, os.path.join(out_dir, f'ckpt_total_perplexity{total_perplexity}.pt'))  
     dist.barrier()
     if iter_num == 0 and eval_only:
         break
